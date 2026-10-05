@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from typing import Any
@@ -23,7 +24,7 @@ PROVIDERS = {
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -36,7 +37,7 @@ PRICES_PER_M = {
     "gpt-4.1-nano": (0.10, 0.40),
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
-    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -91,6 +92,20 @@ def _openai_client(provider: str):
     cfg = PROVIDERS[provider]
     return OpenAI(api_key=os.environ[cfg["key"]], base_url=cfg["base_url"])
 
+def _retry_rate_limit(fn):
+    """Retry transient provider throttling using the delay included in the API error."""
+    from openai import RateLimitError
+
+    for _ in range(10):
+        try:
+            return fn()
+        except RateLimitError as error:
+            match = re.search(r"Please retry in ([0-9.]+)s", str(error), re.IGNORECASE)
+            if not match:
+                raise
+            time.sleep(min(float(match.group(1)) + 0.5, 60.0))
+    return fn()
+
 class MeteredLLM:
     """`chat` and `embed` are drop-in `llm_fn` / `embedding_fn`; `usage` accumulates across calls."""
 
@@ -120,18 +135,18 @@ class MeteredLLM:
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
+                response = _retry_rate_limit(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                     response_format={"type": "json_object"},
-                )
+                ))
             else:
-                response = self._chat_client.chat.completions.create(
+                response = _retry_rate_limit(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
-                )
+                ))
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,7 +173,9 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = _retry_rate_limit(
+            lambda: self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        )
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
